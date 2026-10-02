@@ -4,12 +4,11 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
 /**
- * @author Vincent
- * @version 1.0
+ * Plain context smoke test: all gateway beans wire up successfully.
  */
 @SpringBootTest
 public class ApplicationTests {
     @Test
-    public void contentLoad() {
+    void contextLoads() {
     }
 }

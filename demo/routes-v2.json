@@ -1,0 +1,23 @@
+{
+  "routes": [
+    {
+      "id": "orders",
+      "pathPrefix": "/orders",
+      "stickySession": true,
+      "rateLimit": { "routeLimit": 30, "callerLimit": 10, "windowSeconds": 10 },
+      "backends": [
+        { "id": "backend-1", "baseUrl": "http://127.0.0.1:18081" },
+        { "id": "backend-2", "baseUrl": "http://127.0.0.1:18082" }
+      ]
+    },
+    {
+      "id": "payments",
+      "pathPrefix": "/payments",
+      "stickySession": false,
+      "rateLimit": { "routeLimit": 10, "windowSeconds": 10 },
+      "backends": [
+        { "id": "backend-2", "baseUrl": "http://127.0.0.1:18082" }
+      ]
+    }
+  ]
+}

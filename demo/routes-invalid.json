@@ -1,0 +1,21 @@
+{
+  "routes": [
+    {
+      "id": "good-route",
+      "pathPrefix": "/good",
+      "stickySession": false,
+      "backends": [
+        { "id": "backend-1", "baseUrl": "http://127.0.0.1:18081" }
+      ]
+    },
+    {
+      "id": "bad-route",
+      "pathPrefix": "missing-leading-slash",
+      "stickySession": false,
+      "rateLimit": { "routeLimit": 5, "windowSeconds": 10 },
+      "backends": [
+        { "id": "backend-x", "baseUrl": "not-a-url" }
+      ]
+    }
+  ]
+}
