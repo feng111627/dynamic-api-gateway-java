@@ -124,23 +124,32 @@ class StickyFailoverTest {
             GatewayService gateway = new GatewayService(routes, new RateLimiter(List.of()),
                     new StickySessionStore(1_000, clock::get), health, new Forwarder());
 
-            // 初始粘到 backend-1（路由里排第一的健康实例）
+            // 初始粘到 backend-1（路由里排第一的健康实例，轮询计数从 0 开始）
             assertEquals("backend-1", gateway.handle("/api/h", "c1", "x").backendId());
 
-            // backend-1 故障 -> 切到 backend-2
+            // backend-1 故障：负载均衡下不一定每个请求都先试它，
+            // 用不同调用方打几轮，凡试到它的请求都自动切换成功，且它被标记不健康
             s1.close();
-            clock.addAndGet(2_000); // 让旧会话过期，排除粘性干扰
-            assertEquals("backend-2", gateway.handle("/api/h", "c1", "x").backendId());
+            for (int i = 0; i < 6 && health.isHealthy("backend-1"); i++) {
+                clock.addAndGet(2_000); // 让旧会话过期，排除粘性干扰
+                GatewayResponse resp = gateway.handle("/api/h", "c" + (i + 2), "x");
+                assertEquals(GatewayResponse.ErrorKind.NONE, resp.errorKind(),
+                        "尚有健康实例时请求必须成功切换: " + resp.errorDetail());
+            }
             assertTrue(health.isHealthy("backend-2"));
-            assertTrue(!health.isHealthy("backend-1"));
+            assertTrue(!health.isHealthy("backend-1"), "试到故障实例后应被标记不健康");
 
-            // backend-1 恢复（重启实例 + 健康标记恢复），会话再次过期后可回切
+            // backend-1 恢复（重启实例 + 健康标记恢复），会话过期后几轮内应能自然回切到它
             FakeBackend s1b = new FakeBackend("backend-1", s1.port());
             try (s1b) {
                 health.markHealthy("backend-1");
-                clock.addAndGet(2_000);
-                assertEquals("backend-1", gateway.handle("/api/h", "c1", "x").backendId(),
-                        "实例恢复且旧会话过期后应能回切");
+                boolean cameBack = false;
+                for (int i = 0; i < 6 && !cameBack; i++) {
+                    clock.addAndGet(2_000); // 会话过期后重新选实例
+                    cameBack = "backend-1".equals(
+                            gateway.handle("/api/h", "c-back", "x").backendId());
+                }
+                assertTrue(cameBack, "实例恢复且旧会话过期后应能回切");
             }
         }
     }

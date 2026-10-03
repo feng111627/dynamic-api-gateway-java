@@ -1,7 +1,11 @@
 package com.github.feng111627.dynamicapigatewayjava.web;
 
+import com.github.feng111627.dynamicapigatewayjava.balance.ConcurrencyLimiter;
+import com.github.feng111627.dynamicapigatewayjava.balance.LoadBalancer;
+import com.github.feng111627.dynamicapigatewayjava.balance.WeightedRoundRobinLoadBalancer;
 import com.github.feng111627.dynamicapigatewayjava.gateway.Forwarder;
 import com.github.feng111627.dynamicapigatewayjava.gateway.GatewayService;
+import com.github.feng111627.dynamicapigatewayjava.health.HealthChecker;
 import com.github.feng111627.dynamicapigatewayjava.limit.RateLimitRule;
 import com.github.feng111627.dynamicapigatewayjava.limit.RateLimiter;
 import com.github.feng111627.dynamicapigatewayjava.route.Route;
@@ -48,6 +52,32 @@ public class GatewayConfig {
     }
 
     @Bean
+    public LoadBalancer loadBalancer(HealthRegistry healthRegistry) {
+        // 恢复期（RECOVERING）的实例有效权重压到 1：恢复瞬间不会被全量流量打垮，
+        // 暖机期满回到 HEALTHY 后恢复自身配置权重。
+        return new WeightedRoundRobinLoadBalancer(b ->
+                healthRegistry.stateOf(b.id()) == HealthRegistry.State.RECOVERING
+                        ? 1 : b.weight());
+    }
+
+    @Bean
+    public ConcurrencyLimiter concurrencyLimiter() {
+        return new ConcurrencyLimiter();
+    }
+
+    @Bean(destroyMethod = "close")
+    public HealthChecker healthChecker(
+            HealthRegistry healthRegistry, RouteRegistry routeRegistry,
+            @Value("${gateway.recovery.probe-path:/}") String probePath,
+            @Value("${gateway.recovery.probe-interval-millis:2000}") long intervalMillis,
+            @Value("${gateway.recovery.warmup-millis:5000}") long warmupMillis) {
+        HealthChecker checker = new HealthChecker(healthRegistry, routeRegistry,
+                probePath, intervalMillis, warmupMillis);
+        checker.start();
+        return checker;
+    }
+
+    @Bean
     public Forwarder forwarder() {
         return new Forwarder();
     }
@@ -55,7 +85,10 @@ public class GatewayConfig {
     @Bean
     public GatewayService gatewayService(RouteRegistry routeRegistry, RateLimiter rateLimiter,
                                          StickySessionStore sessionStore,
-                                         HealthRegistry healthRegistry, Forwarder forwarder) {
-        return new GatewayService(routeRegistry, rateLimiter, sessionStore, healthRegistry, forwarder);
+                                         HealthRegistry healthRegistry, Forwarder forwarder,
+                                         LoadBalancer loadBalancer,
+                                         ConcurrencyLimiter concurrencyLimiter) {
+        return new GatewayService(routeRegistry, rateLimiter, sessionStore, healthRegistry,
+                forwarder, loadBalancer, concurrencyLimiter);
     }
 }
