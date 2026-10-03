@@ -127,20 +127,34 @@ class StickyFailoverTest {
             // 初始粘到 backend-1（路由里排第一的健康实例）
             assertEquals("backend-1", gateway.handle("/api/h", "c1", "x").backendId());
 
-            // backend-1 故障 -> 切到 backend-2
+            // backend-1 故障：仍粘在 backend-1 上的会话在下次请求时撞上故障实例，
+            // 网关标记其不健康并自动切到 backend-2
             s1.close();
-            clock.addAndGet(2_000); // 让旧会话过期，排除粘性干扰
-            assertEquals("backend-2", gateway.handle("/api/h", "c1", "x").backendId());
+            GatewayResponse switched = gateway.handle("/api/h", "c1", "x");
+            assertEquals(GatewayResponse.ErrorKind.NONE, switched.errorKind(),
+                    "尚有健康实例时应切换成功: " + switched.errorDetail());
+            assertEquals("backend-2", switched.backendId(), "必须切到另一个健康实例");
             assertTrue(health.isHealthy("backend-2"));
-            assertTrue(!health.isHealthy("backend-1"));
+            assertTrue(!health.isHealthy("backend-1"), "转发失败的故障实例必须被标记不健康");
 
-            // backend-1 恢复（重启实例 + 健康标记恢复），会话再次过期后可回切
+            // 会话过期：即使再用同一调用方，旧绑定也不再影响选择
+            clock.addAndGet(2_000);
+
+            // backend-1 恢复（重启实例 + 健康标记恢复），会话再次过期后的新请求可回切
             FakeBackend s1b = new FakeBackend("backend-1", s1.port());
             try (s1b) {
                 health.markHealthy("backend-1");
                 clock.addAndGet(2_000);
-                assertEquals("backend-1", gateway.handle("/api/h", "c1", "x").backendId(),
-                        "实例恢复且旧会话过期后应能回切");
+                // 新会话在 [b1,b2] 中均衡，反复请求必然有请求重新落到恢复的 backend-1
+                boolean returnedToBackend1 = false;
+                for (int i = 0; i < 4; i++) {
+                    GatewayResponse r = gateway.handle("/api/h", "new-caller-" + i, "x");
+                    assertEquals(GatewayResponse.ErrorKind.NONE, r.errorKind());
+                    if ("backend-1".equals(r.backendId())) {
+                        returnedToBackend1 = true;
+                    }
+                }
+                assertTrue(returnedToBackend1, "实例恢复且旧会话失效后，新会话应能再次落到它上面");
             }
         }
     }
