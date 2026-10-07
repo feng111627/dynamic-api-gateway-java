@@ -130,8 +130,17 @@ public class GatewayService {
                 concurrencyLimiter.release(backend.id());
             }
             if (result.success()) {
-                // 成功：建立/刷新粘性绑定
-                sessionStore.bind(sessionKey, backend.id());
+                // 成功：只有"沿用/新建粘性绑定落点"时才刷新绑定。
+                // 若本次是因为绑定实例打满而临时溢出到别的健康实例，不改绑也不续期——
+                // 打满不是故障，绑定实例腾出余量后后续请求应自然回到它上面。
+                String boundId = sessionStore.find(sessionKey)
+                        .map(StickySession::backendId).orElse(null);
+                if (boundId == null || boundId.equals(backend.id())) {
+                    sessionStore.bind(sessionKey, backend.id());
+                } else {
+                    log.info("route={} caller={} sticky={} at capacity, temporarily served by={}",
+                            route.id(), req.callerId(), boundId, backend.id());
+                }
                 log.info("route={} caller={} -> backend={} status={}",
                         route.id(), req.callerId(), backend.id(), result.statusCode());
                 return GatewayResponse.ok(result.statusCode(), result.body(),
@@ -150,6 +159,11 @@ public class GatewayService {
     /**
      * 选实例：优先沿用未过期且健康的粘性绑定；否则交给负载均衡策略在健康实例中按权重分散。
      * 实例恢复（重新标记健康）后，新绑定/过期重建的绑定可以再次落到它上面。
+     *
+     * 容量语义：粘性绑定的实例若本次已确认打满（在 atCapacity 中），不能原样返回它，
+     * 否则调用方会在"选中 -> tryAcquire 失败"之间无限空转、请求永不返回。
+     * 此时回落到负载均衡，在仍有余量的健康实例里按权重挑一个临时承接（不改粘性绑定：
+     * 打满不是故障，不摘健康、不踢会话；绑定实例腾出余量后后续请求自然回到它上面）。
      */
     private Optional<BackendInstance> pickBackend(Route route, String sessionKey,
                                                   List<String> excluded, List<String> atCapacity) {
@@ -159,6 +173,7 @@ public class GatewayService {
             Optional<BackendInstance> bound = route.backends().stream()
                     .filter(b -> b.id().equals(boundId))
                     .filter(b -> !excluded.contains(b.id()))
+                    .filter(b -> !atCapacity.contains(b.id()))
                     .findFirst();
             if (bound.isPresent() && healthRegistry.isHealthy(boundId)) {
                 return bound;
