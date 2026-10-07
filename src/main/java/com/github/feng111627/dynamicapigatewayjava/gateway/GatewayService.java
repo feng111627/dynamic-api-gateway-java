@@ -26,6 +26,8 @@ import org.slf4j.LoggerFactory;
  *
  * 容量语义：实例并发上限满时不超发、不静默丢弃——先尝试其他健康实例，
  * 所有健康实例都满时返回 503 BACKEND_AT_CAPACITY（与限流 429、无健康后端 503 可区分）。
+ * 已粘在某实例上的请求同样适用：绑定实例满员时与无粘性请求一样改走有余量的健康实例，
+ * 不会反复选中满员实例而卡死空转。
  */
 public class GatewayService {
 
@@ -148,8 +150,11 @@ public class GatewayService {
     }
 
     /**
-     * 选实例：优先沿用未过期且健康的粘性绑定；否则交给负载均衡策略在健康实例中按权重分散。
-     * 实例恢复（重新标记健康）后，新绑定/过期重建的绑定可以再次落到它上面。
+     * 选实例：优先沿用未过期、健康且本轮仍有余量的粘性绑定；绑定实例已被排除、不健康或
+     * 并发已满时，与无粘性请求一样落到下方负载均衡候选集——在其余有余量的健康实例中按
+     * 权重改选，绝不反复返回同一个满员实例（否则调用方会卡死空转，空闲实例也用不上）。
+     * 改选成功后按既有 bind 语义把会话迁到新实例并继续粘住；实例恢复（重新标记健康）后，
+     * 新绑定/过期重建的绑定可以再次落到它上面。
      */
     private Optional<BackendInstance> pickBackend(Route route, String sessionKey,
                                                   List<String> excluded, List<String> atCapacity) {
@@ -159,6 +164,7 @@ public class GatewayService {
             Optional<BackendInstance> bound = route.backends().stream()
                     .filter(b -> b.id().equals(boundId))
                     .filter(b -> !excluded.contains(b.id()))
+                    .filter(b -> !atCapacity.contains(b.id()))
                     .findFirst();
             if (bound.isPresent() && healthRegistry.isHealthy(boundId)) {
                 return bound;

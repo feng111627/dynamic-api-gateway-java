@@ -87,6 +87,22 @@ demo/     本地模拟后端（FakeBackend，echo 服务，支持定制应答/�
     404 `ROUTE_NOT_FOUND`、503 `NO_HEALTHY_BACKEND` 明确区分；
   - 绝不超发（后端在途并发不超过上限），也绝不静默丢弃（每个请求都有明确结果）。
 - **配额释放**：请求结束（成功或失败）即释放该实例配额，后续请求正常放行。
+- **粘性调用方满员改走（本轮缺陷修复）**：此前已粘在某实例上的调用方，在其绑定实例
+  并发打满（例如正卡着一个慢请求）时，请求会被反复选中同一个满员实例而**卡死空转**——
+  既不成功也不报错，网关线程一直被占用，同路由下有余量的健康实例也用不上。
+  根因是选实例的粘性分支只检查"绑定仍有效、实例健康"，漏检"该实例本轮已满"。
+  修复后语义：
+  - 绑定实例已满（或已被排除/不健康）时，该请求与**没有粘性的请求一样**，立即在其余
+    有余量的健康实例中按权重改选并转发，不等待、不空转；改选成功后按既有"切换即重绑"
+    语义把会话迁到新实例并继续粘住（与故障切换的迁移行为一致）。
+  - 只有该路由下**所有健康实例都到上限、确实无处可去**时，才返回
+    **503 `BACKEND_AT_CAPACITY`**（见上文，与 429 限流、404 路由未匹配、
+    503 `NO_HEALTHY_BACKEND` 明确区分）；容量拒绝**不解除**粘性绑定，配额释放后
+    调用方仍粘在原实例。
+  - 任何情况下每个请求都以明确的成功或分类失败结束，不悬挂、不反复重试占用资源，
+    满员实例在途并发绝不超发。
+  - 未被粘住的普通请求、会话有效期内落同一实例、实例故障自动切换、恢复后按 TTL
+    过期回切等既有行为均保持不变。
 
 ## 与上一轮的兼容范围
 
@@ -103,7 +119,7 @@ demo/     本地模拟后端（FakeBackend，echo 服务，支持定制应答/�
 
 ## 七、本地复现与验证
 
-### 1. 跑单测（六大业务域）
+### 1. 跑单测（七大业务域）
 
 ```bash
 mvn test
@@ -123,6 +139,10 @@ mvn test
   状态变化可观察、恢复不打断在途请求。
 - `LoadBalanceCapacityTest`（负载均衡与容量，5 例）：等权均匀分散、按权重分散、
   上限拒绝可区分且不超发、多实例上限独立、配额释放后继续承接。
+- `StickyCapacityFailoverTest`（粘性容量切换，3 例，本轮新增）：
+  粘住的实例打满时及时改走空闲健康实例（带严格超时，修复前会卡死空转）、
+  所有健康实例都打满时粘住的调用方得到可区分的 503 容量拒绝且不破坏粘性绑定、
+  无绑定请求仍按权重分散。
 
 ### 2. 本地端到端复现
 
@@ -176,6 +196,56 @@ for i in $(seq 1 6); do
     -H "X-Caller-Id: cap-$i" &
 done; wait
 ```
+
+**粘性调用方满员改走（本次修复的场景）**：前提同上（两实例各自 `maxConcurrency:1`）。
+注意演示慢请求用 `delayMs=1500`（小于转发器 2 秒请求超时，避免被误判成后端故障而触发
+健康切换，干扰观察）。
+
+- 修复前：sticky-user 绑定的实例被占满后，它的请求一直不返回（终端长时间挂住空转），
+  另一个空闲实例也用不上；
+- 修复后：立即成功返回，响应体里的 `backend=` 已经是另一个有余量的健康实例（实测毫秒级）；
+  改走成功时会话按"切换即重绑"迁到新实例并继续粘住。
+- 若两个实例同时都被慢请求占满，同一个调用方再发请求会**立即**得到
+  `503 {"errorKind":"BACKEND_AT_CAPACITY",...}`（实测毫秒级），不会挂住；
+  配额释放后请求恢复正常，两个实例健康状态始终为 HEALTHY。
+
+```bash
+# 1. 建立粘性：首个新会话按加权轮询落 backend-1
+curl -s localhost:8080/api/hello -H 'X-Caller-Id: sticky-user' | grep -o 'backend=[a-z0-9-]*'
+#   -> backend=backend-1
+
+# 2. 用一个一次性调用方把轮询游标推过 backend-2（请求很快结束，不占配额）
+curl -s localhost:8080/api/hello -H 'X-Caller-Id: advance' | grep -o 'backend=[a-z0-9-]*'
+#   -> backend=backend-2
+
+# 3. 下一个新会话 holder-1 按轮询正好落到 sticky-user 绑定的 backend-1，挂慢请求占满它
+curl -s "localhost:8080/api/slow?delayMs=1500" -H 'X-Caller-Id: holder-1' -o /dev/null &
+
+# 4. 立刻用同一个粘性调用方再发：修复前挂住不返回；修复后秒回 backend-2
+sleep 0.4
+curl -s -w ' [HTTP %{http_code} 耗时=%{time_total}s]\n' --max-time 3 \
+  localhost:8080/api/hello -H 'X-Caller-Id: sticky-user'
+#   -> backend=backend-2 ... [HTTP 200 耗时≈0.01s]
+
+# 5. 边界：等第 3 步慢请求结束后，两个新调用方同时各挂一个慢请求，把两个实例都占满
+sleep 1.5
+curl -s "localhost:8080/api/slow?delayMs=1500" -H 'X-Caller-Id: holder-2' -o /dev/null &
+curl -s "localhost:8080/api/slow?delayMs=1500" -H 'X-Caller-Id: holder-3' -o /dev/null &
+sleep 0.4
+curl -s -w '\n[HTTP %{http_code} 耗时=%{time_total}s]\n' --max-time 3 \
+  localhost:8080/api/hello -H 'X-Caller-Id: sticky-user'
+#   -> {"errorKind":"BACKEND_AT_CAPACITY",...,"atCapacity=[backend-2, backend-1]"}
+#      [HTTP 503 耗时≈0.004s]
+
+# 6. 慢请求结束、配额释放后恢复正常；会话已粘在改走后的 backend-2
+sleep 1.5
+curl -s localhost:8080/api/hello -H 'X-Caller-Id: sticky-user'   # -> backend=backend-2
+curl -s localhost:8080/admin/health                              # 两个实例始终 HEALTHY
+```
+
+> 自动化复现见 `StickyCapacityFailoverTest`：测试直接持有网关的 `ConcurrencyLimiter`
+> 精确占满目标实例（不依赖轮询顺序），并用 `Future.get(3, SECONDS)` 给请求下严格超时——
+> 修复前该用例必现"3 秒后断言卡住"，修复后稳定秒回，可重复执行。
 
 **限流**（默认 60 次/分钟/调用方/路由，第 61 次起 429）：
 
